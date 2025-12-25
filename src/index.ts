@@ -39,6 +39,14 @@ type ReadJarResult = {
   sourceJar?: string;
 };
 
+type ProjectType = "maven" | "gradle" | "native";
+
+type ProjectDetection = {
+  type: ProjectType;
+  root: string | null;
+  markers: string[];
+};
+
 type DependencyInfo = {
   groupId: string;
   artifactId: string;
@@ -51,6 +59,8 @@ type DependencyInfo = {
 
 type DependencyResult = {
   projectPath: string;
+  projectRoot: string | null;
+  projectType: ProjectType;
   dependencies: DependencyInfo[];
   cached: boolean;
   logTail?: string;
@@ -60,6 +70,12 @@ type CommandResult = {
   code: number | null;
   stdout: string;
   stderr: string;
+  project: ProjectDetection;
+};
+
+type CommandOptions = {
+  cwd?: string;
+  projectPath?: string;
 };
 
 const listJarEntriesSchema = z.object({
@@ -90,6 +106,52 @@ async function fileExists(filePath: string): Promise<boolean> {
   }
 }
 
+async function findProjectMarkers(dir: string, markers: string[]): Promise<string[]> {
+  const found: string[] = [];
+  for (const marker of markers) {
+    if (await fileExists(path.join(dir, marker))) {
+      found.push(marker);
+    }
+  }
+  return found;
+}
+
+async function detectProjectType(startPath: string): Promise<ProjectDetection> {
+  let current = path.resolve(startPath);
+  const stat = await fsPromises.stat(current).catch(() => null);
+  if (stat?.isFile()) {
+    current = path.dirname(current);
+  }
+
+  const mavenMarkers = ["pom.xml"];
+  const gradleMarkers = ["build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts"];
+
+  while (true) {
+    const foundMaven = await findProjectMarkers(current, mavenMarkers);
+    if (foundMaven.length > 0) {
+      return { type: "maven", root: current, markers: foundMaven };
+    }
+
+    const foundGradle = await findProjectMarkers(current, gradleMarkers);
+    if (foundGradle.length > 0) {
+      return { type: "gradle", root: current, markers: foundGradle };
+    }
+
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+
+  return { type: "native", root: null, markers: [] };
+}
+
+function requiredProjectTypeForCommand(command: string): ProjectType | "any" {
+  const normalized = path.basename(command).toLowerCase();
+  if (normalized === "mvn") return "maven";
+  if (normalized === "gradle" || normalized === "gradlew") return "gradle";
+  return "any";
+}
+
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -104,7 +166,17 @@ function limitText(text: string, limit = MAX_TEXT_BYTES): { text: string; trunca
   };
 }
 
-async function runCommand(command: string, args: string[], options: { cwd?: string } = {}): Promise<CommandResult> {
+async function runCommand(command: string, args: string[], options: CommandOptions = {}): Promise<CommandResult> {
+  const projectContext = options.projectPath ?? options.cwd ?? process.cwd();
+  const project = await detectProjectType(projectContext);
+  const requiredType = requiredProjectTypeForCommand(command);
+  if (requiredType !== "any" && project.type !== requiredType) {
+    const rootLabel = project.root ? ` (root: ${project.root})` : "";
+    throw new Error(
+      `Command "${command}" requires a ${requiredType} project, but detected ${project.type}${rootLabel}.`,
+    );
+  }
+
   return await new Promise<CommandResult>((resolve, reject) => {
     const child = spawn(command, args, {
       cwd: options.cwd,
@@ -122,6 +194,7 @@ async function runCommand(command: string, args: string[], options: { cwd?: stri
         code,
         stdout: Buffer.concat(stdoutChunks).toString("utf-8"),
         stderr: Buffer.concat(stderrChunks).toString("utf-8"),
+        project,
       }),
     );
   });
@@ -300,17 +373,21 @@ class JarViewerService {
     try {
       let commandResult: CommandResult;
       try {
-        commandResult = await runCommand("java", [
-          "-jar",
-          cfrJar,
-          jarPath,
-          "--outputdir",
-          outputDir,
-          "--jarfilter",
-          jarFilter,
-          "--silent",
-          "true",
-        ]);
+        commandResult = await runCommand(
+          "java",
+          [
+            "-jar",
+            cfrJar,
+            jarPath,
+            "--outputdir",
+            outputDir,
+            "--jarfilter",
+            jarFilter,
+            "--silent",
+            "true",
+          ],
+          { projectPath: jarPath },
+        );
       } catch (error) {
         if (isEnoent(error)) {
           throw new Error("Java runtime (java) was not found on PATH.");
@@ -349,12 +426,11 @@ class JarViewerService {
 
   private async tryJavapSignature(jarPath: string, className: string): Promise<string | null> {
     try {
-      const { code, stdout, stderr } = await runCommand("javap", [
-        "-classpath",
-        jarPath,
-        "-public",
-        className,
-      ]);
+      const { code, stdout, stderr } = await runCommand(
+        "javap",
+        ["-classpath", jarPath, "-public", className],
+        { projectPath: jarPath },
+      );
       if (code !== 0) {
         return null;
       }
@@ -366,20 +442,28 @@ class JarViewerService {
 
   async scanProjectDependencies(projectPath: string): Promise<DependencyResult> {
     const resolvedProject = path.resolve(projectPath);
-    const cached = this.dependencyCache.get(resolvedProject);
-    if (cached) {
-      return { ...cached, cached: true };
+    const projectInfo = await detectProjectType(resolvedProject);
+
+    if (projectInfo.type === "gradle") {
+      throw new Error(
+        `Gradle project detected at ${projectInfo.root ?? resolvedProject}. Not supported yet.`,
+      );
     }
 
-    const pomPath = path.join(resolvedProject, "pom.xml");
-    const gradlePath = path.join(resolvedProject, "build.gradle");
-    const gradleKtsPath = path.join(resolvedProject, "build.gradle.kts");
+    if (projectInfo.type !== "maven") {
+      throw new Error(`No Maven project detected at or above ${resolvedProject}.`);
+    }
 
-    if (!(await fileExists(pomPath))) {
-      if (await fileExists(gradlePath) || await fileExists(gradleKtsPath)) {
-        throw new Error("Gradle projects are not supported yet. Please point to a Maven project (pom.xml).");
-      }
-      throw new Error("No pom.xml found. Provide a Maven project directory.");
+    const projectRoot = projectInfo.root ?? resolvedProject;
+    const cached = this.dependencyCache.get(projectRoot);
+    if (cached) {
+      return {
+        ...cached,
+        cached: true,
+        projectPath: resolvedProject,
+        projectRoot,
+        projectType: projectInfo.type,
+      };
     }
 
     const tempDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "jar-viewer-mvn-"));
@@ -396,7 +480,8 @@ class JarViewerService {
       ];
 
       const { code, stdout, stderr } = await runCommand("mvn", mvnArgs, {
-        cwd: resolvedProject,
+        cwd: projectRoot,
+        projectPath: projectRoot,
       });
 
       const fileContent = await fsPromises.readFile(outputFile, "utf-8").catch(() => "");
@@ -409,11 +494,13 @@ class JarViewerService {
       const dependencies = parseMavenDependencyList(fileContent);
       const result: DependencyResult = {
         projectPath: resolvedProject,
+        projectRoot,
+        projectType: projectInfo.type,
         dependencies,
         cached: false,
         logTail: (stderr || stdout || "").trim().split("\n").slice(-10).join("\n"),
       };
-      this.dependencyCache.set(resolvedProject, result);
+      this.dependencyCache.set(projectRoot, result);
       return result;
     } catch (error) {
       if (isEnoent(error)) {
