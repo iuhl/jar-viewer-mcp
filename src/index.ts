@@ -76,6 +76,7 @@ type CommandResult = {
 type CommandOptions = {
   cwd?: string;
   projectPath?: string;
+  shell?: boolean;
 };
 
 const listJarEntriesSchema = z.object({
@@ -147,8 +148,15 @@ async function detectProjectType(startPath: string): Promise<ProjectDetection> {
 
 function requiredProjectTypeForCommand(command: string): ProjectType | "any" {
   const normalized = path.basename(command).toLowerCase();
-  if (normalized === "mvn") return "maven";
-  if (normalized === "gradle" || normalized === "gradlew") return "gradle";
+  if (normalized === "mvn" || normalized === "mvn.cmd") return "maven";
+  if (
+    normalized === "gradle" ||
+    normalized === "gradle.bat" ||
+    normalized === "gradlew" ||
+    normalized === "gradlew.bat"
+  ) {
+    return "gradle";
+  }
   return "any";
 }
 
@@ -180,6 +188,7 @@ async function runCommand(command: string, args: string[], options: CommandOptio
   return await new Promise<CommandResult>((resolve, reject) => {
     const child = spawn(command, args, {
       cwd: options.cwd,
+      shell: options.shell ?? false,
       stdio: ["ignore", "pipe", "pipe"],
     });
 
@@ -440,18 +449,23 @@ class JarViewerService {
     }
   }
 
+  private async resolveGradleCommand(
+    projectRoot: string,
+  ): Promise<{ command: string; shell: boolean }> {
+    const wrapperName = process.platform === "win32" ? "gradlew.bat" : "gradlew";
+    const wrapperPath = path.join(projectRoot, wrapperName);
+    if (await fileExists(wrapperPath)) {
+      return { command: wrapperPath, shell: process.platform === "win32" };
+    }
+    return { command: "gradle", shell: false };
+  }
+
   async scanProjectDependencies(projectPath: string): Promise<DependencyResult> {
     const resolvedProject = path.resolve(projectPath);
     const projectInfo = await detectProjectType(resolvedProject);
 
-    if (projectInfo.type === "gradle") {
-      throw new Error(
-        `Gradle project detected at ${projectInfo.root ?? resolvedProject}. Not supported yet.`,
-      );
-    }
-
-    if (projectInfo.type !== "maven") {
-      throw new Error(`No Maven project detected at or above ${resolvedProject}.`);
+    if (projectInfo.type === "native") {
+      throw new Error(`No Maven or Gradle project detected at or above ${resolvedProject}.`);
     }
 
     const projectRoot = projectInfo.root ?? resolvedProject;
@@ -466,6 +480,21 @@ class JarViewerService {
       };
     }
 
+    let result: DependencyResult;
+    if (projectInfo.type === "maven") {
+      result = await this.scanMavenDependencies(resolvedProject, projectRoot);
+    } else {
+      result = await this.scanGradleDependencies(resolvedProject, projectRoot);
+    }
+
+    this.dependencyCache.set(projectRoot, result);
+    return result;
+  }
+
+  private async scanMavenDependencies(
+    resolvedProject: string,
+    projectRoot: string,
+  ): Promise<DependencyResult> {
     const tempDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "jar-viewer-mvn-"));
     const outputFile = path.join(tempDir, "dependencies.txt");
 
@@ -495,16 +524,74 @@ class JarViewerService {
       const result: DependencyResult = {
         projectPath: resolvedProject,
         projectRoot,
-        projectType: projectInfo.type,
+        projectType: "maven",
         dependencies,
         cached: false,
         logTail: (stderr || stdout || "").trim().split("\n").slice(-10).join("\n"),
       };
-      this.dependencyCache.set(projectRoot, result);
       return result;
     } catch (error) {
       if (isEnoent(error)) {
         throw new Error("Maven executable (mvn) was not found on PATH.");
+      }
+      throw error instanceof Error ? error : new Error(String(error));
+    } finally {
+      await fsPromises.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+
+  private async scanGradleDependencies(
+    resolvedProject: string,
+    projectRoot: string,
+  ): Promise<DependencyResult> {
+    const tempDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "jar-viewer-gradle-"));
+    const initScriptPath = path.join(tempDir, "mcp-init.gradle");
+    const initScript = [
+      "allprojects {",
+      "  task mcpListDeps {",
+      "    doLast {",
+      "      configurations.each { config ->",
+      "        if (config.canBeResolved) {",
+      "          config.files.each { file ->",
+      "            println \"MCP_DEP|${config.name}|${file.name}|${file.absolutePath}\"",
+      "          }",
+      "        }",
+      "      }",
+      "    }",
+      "  }",
+      "}",
+      "",
+    ].join("\n");
+
+    try {
+      await fsPromises.writeFile(initScriptPath, initScript, "utf-8");
+      const { command, shell } = await this.resolveGradleCommand(projectRoot);
+      const gradleArgs = ["--init-script", initScriptPath, "mcpListDeps", "-q"];
+
+      const { code, stdout, stderr } = await runCommand(command, gradleArgs, {
+        cwd: projectRoot,
+        projectPath: projectRoot,
+        shell,
+      });
+
+      if (code !== 0) {
+        throw new Error(
+          `gradle mcpListDeps failed with code ${code}. stderr: ${stderr || stdout || "no output"}`,
+        );
+      }
+
+      const dependencies = parseGradleDependencyOutput(stdout);
+      return {
+        projectPath: resolvedProject,
+        projectRoot,
+        projectType: "gradle",
+        dependencies,
+        cached: false,
+        logTail: (stderr || stdout || "").trim().split("\n").slice(-10).join("\n"),
+      };
+    } catch (error) {
+      if (isEnoent(error)) {
+        throw new Error("Gradle executable (gradle/gradlew) was not found on PATH.");
       }
       throw error instanceof Error ? error : new Error(String(error));
     } finally {
@@ -545,6 +632,90 @@ function parseMavenDependencyList(output: string): DependencyInfo[] {
   }
 
   return dependencies;
+}
+
+type GradleDependencyEntry = {
+  configuration: string;
+  fileName: string;
+  filePath: string;
+};
+
+function parseGradleDependencyOutput(output: string): DependencyInfo[] {
+  const dependencies = new Map<string, DependencyInfo>();
+  const lines = output.split(/\r?\n/);
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line.startsWith("MCP_DEP|")) continue;
+    const entry = parseGradleDependencyLine(line);
+    if (!entry) continue;
+    if (dependencies.has(entry.filePath)) continue;
+    dependencies.set(entry.filePath, buildGradleDependencyInfo(entry));
+  }
+
+  return Array.from(dependencies.values());
+}
+
+function parseGradleDependencyLine(line: string): GradleDependencyEntry | null {
+  const parts = line.split("|");
+  if (parts.length < 4) return null;
+  const configuration = parts[1]?.trim();
+  const fileName = parts[2]?.trim();
+  const filePath = parts.slice(3).join("|").trim();
+  if (!configuration || !fileName || !filePath) return null;
+  return { configuration, fileName, filePath };
+}
+
+type GradleCacheCoords = {
+  groupId: string;
+  artifactId: string;
+  version: string;
+  classifier: string | null;
+};
+
+function buildGradleDependencyInfo(entry: GradleDependencyEntry): DependencyInfo {
+  const ext = path.extname(entry.fileName);
+  const type = ext.replace(/^\./, "") || "jar";
+  const baseName = path.basename(entry.fileName, ext);
+
+  const cacheCoords = parseGradleCachePath(entry.filePath, entry.fileName);
+  const groupId = cacheCoords?.groupId ?? "unknown";
+  const artifactId = cacheCoords?.artifactId ?? (baseName || "unknown");
+  const version = cacheCoords?.version ?? "unknown";
+  const classifier = cacheCoords?.classifier ?? null;
+
+  return {
+    groupId,
+    artifactId,
+    type,
+    classifier,
+    version,
+    scope: entry.configuration,
+    path: entry.filePath,
+  };
+}
+
+function parseGradleCachePath(filePath: string, fileName: string): GradleCacheCoords | null {
+  const normalized = filePath.split(path.sep).join("/");
+  const marker = "/modules-2/files-2.1/";
+  const markerIndex = normalized.indexOf(marker);
+  if (markerIndex === -1) return null;
+
+  const rest = normalized.slice(markerIndex + marker.length);
+  const parts = rest.split("/");
+  if (parts.length < 4) return null;
+
+  const groupId = parts[0];
+  const artifactId = parts[1];
+  const version = parts[2];
+  if (!groupId || !artifactId || !version) return null;
+
+  const ext = path.extname(fileName);
+  const baseName = path.basename(fileName, ext);
+  const prefix = `${artifactId}-${version}`;
+  const classifier = baseName.startsWith(`${prefix}-`) ? baseName.slice(prefix.length + 1) : null;
+
+  return { groupId, artifactId, version, classifier };
 }
 
 function formatToolResult(result: unknown): CallToolResult {

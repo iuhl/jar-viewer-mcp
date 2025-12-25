@@ -17,7 +17,7 @@
 *   **核心依赖**:
     *   **ZIP 处理**: `adm-zip` (用于读取 JAR 归档)
     *   **反编译核心**: `CFR` (Java Decompiler, 以 jar 包形式内置于项目)
-    *   **外部调用**: Node.js `child_process` (调用 `java` 和 `mvn` 命令)
+    *   **外部调用**: Node.js `child_process` (调用 `java`, `mvn`, `gradlew` 命令)
 
 ## 3. 系统架构 (Architecture)
 
@@ -36,7 +36,7 @@ graph TD
     subgraph "Infrastructure"
         ZipLib[adm-zip]
         JavaRuntime[Local JRE]
-        Maven[Local Maven]
+        BuildTools[Maven / Gradle]
     end
     
     subgraph "File System"
@@ -55,7 +55,7 @@ graph TD
     JavaRuntime -- 执行 --> CfrJar
     CfrJar -- 读取 --> JarFile
     
-    DepScanner -- 调用 --> Maven
+    DepScanner -- 调用 --> BuildTools
 ```
 
 ## 4. 核心工具定义 (Tool Definitions)
@@ -86,9 +86,13 @@ graph TD
 *   **输入参数**:
     *   `projectPath` (string): 项目根目录（包含 pom.xml 或 build.gradle）。
 *   **实现细节**:
-    *   **Maven**: 执行 `mvn dependency:list -DoutputAbsoluteArtifactFilename=true ...`。
-    *   **解析**: 读取 Maven 输出文件，建立 `ArtifactId -> AbsolutePath` 的映射表。
-    *   **缓存**: 在内存中缓存项目路径对应的依赖列表，避免重复执行耗时的 Maven 命令。
+    *   **项目类型判定**: 命令执行前从 `projectPath` 向上查找 `pom.xml` / `build.gradle(.kts)` / `settings.gradle(.kts)`，判定 `maven` / `gradle` / `native` 并定位 `projectRoot`，`mvn` 与 `gradle/gradlew` 命令会校验类型，不匹配直接报错。
+    *   **Maven**: 执行 `mvn dependency:list -DoutputAbsoluteArtifactFilename=true ...` 并解析文本输出。
+    *   **Gradle**:
+        *   采用 **Init Script (初始化脚本)** 注入策略，确保对用户项目无侵入。
+        *   运行时动态生成临时脚本，通过 `./gradlew --init-script mcp-init.gradle` 执行任务，输出所有 Configuration 中 Artifact 的绝对路径。
+    *   **多模块支持**: 递归处理子模块（Sub-modules），汇总整个项目树的所有引用 Jar 包。
+    *   **缓存**: 在内存中建立 `ProjectHash -> DependencyList` 缓存，避免重复执行耗时的构建命令。
 
 ## 5. 关键流程设计
 
@@ -116,11 +120,55 @@ graph TD
     ```
 *   **路径解析**: 代码中禁止使用硬编码路径，必须使用 `import.meta.url` 或 `__dirname` 动态计算 `lib/cfr.jar` 的相对位置。
 
+### 5.3. Gradle 深度集成策略 (Gradle Integration)
+与 Maven 简单的命令行参数不同，Gradle 需要通过自定义任务来暴露文件路径。为了保证 **无侵入性**（不修改用户的 build.gradle）和 **兼容性**（支持 Gradle 4.x - 8.x），我们采用动态注入 Init Script 的方式。
+
+**执行时序**:
+```mermaid
+sequenceDiagram
+    participant MCP as MCP Server
+    participant FS as File System
+    participant GW as Gradle Wrapper (./gradlew)
+
+    MCP->>FS: 1. 写入临时脚本 (mcp-deps.gradle)
+    Note right of FS: define task "mcpListDeps" <br/> iterate configurations <br/> print absolute paths
+    MCP->>GW: 2. 执行 ./gradlew -I mcp-deps.gradle mcpListDeps -q
+    GW-->>MCP: 3. 返回 Stdout (格式化数据)
+    MCP->>MCP: 4. 解析文本并去重
+    MCP->>FS: 5. 删除临时脚本
+```
+
+**Init Script 核心逻辑 (Groovy)**:
+```groovy
+allprojects {
+    task mcpListDeps {
+        doLast {
+            configurations.each { config ->
+                if (config.canBeResolved) { // 仅处理可解析配置
+                    config.files.each { file ->
+                        println "MCP_DEP|${config.name}|${file.name}|${file.absolutePath}"
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+### 5.4. 项目类型探测 (Project Type Detection)
+为避免在错误目录执行构建命令，所有外部命令执行前都会先做项目类型判定：
+1.  从 `projectPath`/`cwd` 开始向上查找。
+2.  命中 `pom.xml` 判定为 **Maven**；命中 `build.gradle(.kts)` 或 `settings.gradle(.kts)` 判定为 **Gradle**。
+3.  未命中则判定为 **Native**（无构建系统）。
+4.  仅当命令类型与项目类型匹配时才执行（例如 `mvn` 必须是 Maven 项目）。
+
 ## 6. 环境依赖 (Prerequisites)
 
 虽然 MCP Server 本身是 Node.js 应用，但运行时依赖宿主机的以下环境：
 1.  **Java Runtime Environment (JRE/JDK)**: 版本 >= 8。用于运行 CFR 反编译工具。
-2.  **Maven (可选)**: 仅当使用 `scan_project_dependencies` 功能时需要。
+2.  **构建工具 (可选)**: 仅当使用 `scan_project_dependencies` 功能时需要。
+    *   **Maven**: 需系统 PATH 中包含 `mvn`。
+    *   **Gradle**: 优先使用项目自带的 `./gradlew`；若无，则需系统 PATH 中包含 `gradle`。
 
 ## 7. 交互示例 (User Journey)
 
@@ -128,7 +176,10 @@ graph TD
 
 1.  **用户**: "分析一下当前项目中 `spring-web` 的 `DispatcherServlet` 是如何初始化的。"
 2.  **Model**: 调用 `scan_project_dependencies(projectPath=".")`。
-3.  **MCP**: 返回依赖列表，包含 `.../repository/org/springframework/spring-web/5.3.x/spring-web-5.3.x.jar`。
+3.  **MCP**:
+    *   在执行命令前先做项目类型探测（从 `projectPath` 向上查找标识文件），确认是 Gradle 项目并定位 `projectRoot`。
+    *   注入 Init Script 并运行 Gradle Wrapper。
+    *   返回依赖列表，包含 `.../caches/modules-2/files-2.1/org.springframework/spring-web/5.3.x/.../spring-web-5.3.x.jar`。
 4.  **Model**: 解析出 jar 路径，调用 `list_jar_entries(jarPath="...", innerPath="org/springframework/web/servlet/DispatcherServlet")` 确认路径。
 5.  **Model**: 调用 `read_jar_entry(jarPath="...", entryPath=".../DispatcherServlet.class")`。
 6.  **MCP**:
@@ -138,7 +189,4 @@ graph TD
 7.  **Model**: 阅读源码并回答用户问题。
 
 ## 8. 未来规划 (Roadmap)
-
-*   **Gradle 深度支持**: 通过 Init Script 或 Tooling API 解析 Gradle 依赖路径。
 *   **JDK 核心库浏览**: 支持浏览 `rt.jar` 或 `jmods` (Java 9+)，允许用户查询 JDK 原生类的实现。
-*   **搜索增强**: 在 Jar 包内实现基于类名或方法名的模糊搜索。
