@@ -1,0 +1,38 @@
+{
+  "name": "jar-viewer-mcp",
+  "version": "0.1.0",
+  "description": "MCP server that lets LLMs browse and decompile Java JARs with optional source attachment.",
+  "type": "module",
+  "bin": {
+    "jar-viewer-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "clean": "rm -rf dist",
+    "build": "npm run clean && tsc -p tsconfig.json && node scripts/copy-assets.mjs",
+    "dev": "tsx src/index.ts",
+    "lint": "tsc --noEmit"
+  },
+  "keywords": [
+    "mcp",
+    "java",
+    "jar",
+    "decompiler",
+    "cfr"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.25.1",
+    "adm-zip": "^0.5.16",
+    "zod": "^4.2.1"
+  },
+  "devDependencies": {
+    "@types/adm-zip": "^0.5.7",
+    "@types/node": "^20.17.16",
+    "tsx": "^4.21.0",
+    "typescript": "^5.7.3"
+  }
+}
