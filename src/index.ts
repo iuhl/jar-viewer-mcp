@@ -71,6 +71,7 @@ type ScanDependenciesOptions = {
   excludeTransitive?: boolean;
   configurations?: string[];
   includeLogTail?: boolean;
+  query?: string;
 };
 
 type CommandResult = {
@@ -101,6 +102,7 @@ const scanDependenciesSchema = z.object({
   excludeTransitive: z.boolean().optional(),
   configurations: z.array(z.string().min(1)).optional(),
   includeLogTail: z.boolean().optional(),
+  query: z.string().optional(),
 });
 
 function normalizeJarEntry(p?: string): string {
@@ -123,6 +125,26 @@ function normalizeConfigurations(configurations?: string[]): string[] {
     configurations.map((value) => value.trim()).filter((value) => value.length > 0),
   );
   return Array.from(unique).sort((a, b) => a.localeCompare(b));
+}
+
+function normalizeQuery(value?: string): string | null {
+  if (!value) return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  return trimmed.toLowerCase();
+}
+
+function filterDependenciesByQuery(
+  dependencies: DependencyInfo[],
+  query?: string,
+): DependencyInfo[] {
+  const normalized = normalizeQuery(query);
+  if (!normalized) return dependencies;
+  return dependencies.filter((dep) => {
+    const name = `${dep.groupId}:${dep.artifactId}`.toLowerCase();
+    if (name.includes(normalized)) return true;
+    return dep.path.toLowerCase().includes(normalized);
+  });
 }
 
 function buildDependencyCacheKey(
@@ -507,6 +529,7 @@ class JarViewerService {
       excludeTransitive = false,
       configurations,
       includeLogTail = false,
+      query,
     } = options;
     const resolvedProject = path.resolve(projectPath);
     const projectInfo = await detectProjectType(resolvedProject);
@@ -523,12 +546,14 @@ class JarViewerService {
     });
     const cached = this.dependencyCache.get(cacheKey);
     if (cached) {
+      const filteredDependencies = filterDependenciesByQuery(cached.dependencies, query);
       return {
         ...cached,
         cached: true,
         projectPath: resolvedProject,
         projectRoot,
         projectType: projectInfo.type,
+        dependencies: filteredDependencies,
       };
     }
 
@@ -547,7 +572,14 @@ class JarViewerService {
     }
 
     this.dependencyCache.set(cacheKey, result);
-    return result;
+    const filteredDependencies = filterDependenciesByQuery(result.dependencies, query);
+    if (filteredDependencies === result.dependencies) {
+      return result;
+    }
+    return {
+      ...result,
+      dependencies: filteredDependencies,
+    };
   }
 
   private async scanMavenDependencies(
@@ -874,7 +906,7 @@ async function main() {
     {
       title: "Scan project dependencies",
       description:
-        "Resolve absolute paths for Maven/Gradle dependencies. Supports excludeTransitive and Gradle configurations filters; cached per project root.",
+        "Resolve absolute paths for Maven/Gradle dependencies. Supports excludeTransitive, query, and Gradle configurations filters; cached per project root.",
       inputSchema: scanDependenciesSchema,
     },
     async (input) => {

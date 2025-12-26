@@ -18,7 +18,7 @@ node dist/index.js   # or add to your MCP registry
 ## Tools
 - `list_jar_entries(jarPath, innerPath?)`: Lists up to 100 items from the JAR, folding by directory level for quick navigation.
 - `read_jar_entry(jarPath, entryPath)`: Reads the requested entry. For `.class`, it first looks for a sibling `*-sources.jar` and otherwise decompiles with CFR; falls back to `javap` signatures if needed.
-- `scan_project_dependencies(projectPath, excludeTransitive?, configurations?, includeLogTail?)`: Detects Maven/Gradle projects (by `pom.xml` or `build.gradle(.kts)`/`settings.gradle(.kts)`), then resolves absolute artifact paths. Uses `mvn dependency:list` for Maven, and an injected Gradle init script (`mcpListDeps`) for Gradle. Results are cached per project root.
+- `scan_project_dependencies(projectPath, excludeTransitive?, configurations?, includeLogTail?, query?)`: Detects Maven/Gradle projects (by `pom.xml` or `build.gradle(.kts)`/`settings.gradle(.kts)`), then resolves absolute artifact paths. Uses `mvn dependency:list` for Maven, and an injected Gradle init script (`mcpListDeps`) for Gradle. Results are cached per project root. `query` does a case-insensitive substring match on `groupId:artifactId` and the artifact path.
   - `excludeTransitive`: set to `true` to return only first-level dependencies.
   - `configurations`: Gradle-only list of configuration names to include (e.g. `["runtimeClasspath"]`).
   - `includeLogTail`: set to `true` to include the last lines of build output for debugging.

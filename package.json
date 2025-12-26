@@ -13,7 +13,8 @@
     "clean": "rm -rf dist",
     "build": "npm run clean && tsc -p tsconfig.json && node scripts/copy-assets.mjs",
     "dev": "tsx src/index.ts",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "mcp:test": "node scripts/mcp-test.mjs"
   },
   "keywords": [
     "mcp",
