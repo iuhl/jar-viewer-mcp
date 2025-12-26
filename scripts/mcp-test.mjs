@@ -16,6 +16,8 @@ if (help) {
 Examples:
   node scripts/mcp-test.mjs scan_project_dependencies '{"projectPath":"/path/to/project"}'
   node scripts/mcp-test.mjs list_jar_entries '{"jarPath":"/path/to/app.jar","innerPath":"com/example"}'
+  node scripts/mcp-test.mjs resolve_class '{"projectPath":".","className":"org.springframework.data.redis.core.RedisTemplate","includeMembers":true,"methodQuery":"opsFor"}'
+  node scripts/mcp-test.mjs describe_class '{"jarPath":"/path/to/spring-data-redis.jar","className":"org.springframework.data.redis.core.RedisTemplate","methodQuery":"opsFor"}'
 
 Defaults:
   toolName = scan_project_dependencies

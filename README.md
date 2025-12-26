@@ -4,7 +4,7 @@ MCP server that lets an LLM browse JAR contents, attach `*-sources.jar` source, 
 
 ## Prerequisites
 - Node.js 18+
-- Java 8+ on PATH (for CFR)
+- Java 8+ (JDK with `javap`) on PATH (for CFR and describe_class)
 - Maven on PATH when using `scan_project_dependencies` for Maven projects
 - Gradle Wrapper (`./gradlew`) or Gradle on PATH when using `scan_project_dependencies` for Gradle projects
 
@@ -18,6 +18,8 @@ node dist/index.js   # or add to your MCP registry
 ## Tools
 - `list_jar_entries(jarPath, innerPath?)`: Lists up to 100 items from the JAR, folding by directory level for quick navigation.
 - `read_jar_entry(jarPath, entryPath)`: Reads the requested entry. For `.class`, it first looks for a sibling `*-sources.jar` and otherwise decompiles with CFR; falls back to `javap` signatures if needed.
+- `describe_class(jarPath, className?, entryPath?, memberVisibility?, methodQuery?, limit?)`: Returns method signatures for a class using `javap` (no decompilation). Use `memberVisibility="public"` (default) or `"all"` for all members.
+- `resolve_class(projectPath, className, dependencyQuery?, includeMembers?, memberVisibility?, methodQuery?, limit?)`: Locates the class inside project dependency jars. If `includeMembers=true`, also returns method signatures (same filters as `describe_class`).
 - `scan_project_dependencies(projectPath, excludeTransitive?, configurations?, includeLogTail?, query?)`: Detects Maven/Gradle projects (by `pom.xml` or `build.gradle(.kts)`/`settings.gradle(.kts)`), then resolves absolute artifact paths. Uses `mvn dependency:list` for Maven, and an injected Gradle init script (`mcpListDeps`) for Gradle. Results are cached per project root. `query` does a case-insensitive substring match on `groupId:artifactId` and the artifact path.
   - `excludeTransitive`: set to `true` to return only first-level dependencies.
   - `configurations`: Gradle-only list of configuration names to include (e.g. `["runtimeClasspath"]`).

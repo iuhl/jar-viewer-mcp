@@ -66,6 +66,52 @@ type DependencyResult = {
   logTail?: string;
 };
 
+type DescribeClassOptions = {
+  jarPath: string;
+  className?: string;
+  entryPath?: string;
+  memberVisibility?: "public" | "all";
+  methodQuery?: string;
+  limit?: number;
+};
+
+type DescribeClassResult = {
+  jarPath: string;
+  className: string;
+  visibility: "public" | "all";
+  methodQuery?: string;
+  total: number;
+  truncated: boolean;
+  methods: string[];
+};
+
+type ResolveClassOptions = {
+  projectPath: string;
+  className: string;
+  dependencyQuery?: string;
+  includeMembers?: boolean;
+  memberVisibility?: "public" | "all";
+  methodQuery?: string;
+  limit?: number;
+};
+
+type ResolveClassResult = {
+  projectPath: string;
+  className: string;
+  entryPath: string;
+  jarPath: string | null;
+  projectRoot: string | null;
+  projectType: ProjectType;
+  dependencyQuery?: string;
+  dependencyCount: number;
+  searchedJars: number;
+  cachedDependencies: boolean;
+  found: boolean;
+  methods?: string[];
+  methodCount?: number;
+  methodsTruncated?: boolean;
+};
+
 type ScanDependenciesOptions = {
   projectPath: string;
   excludeTransitive?: boolean;
@@ -103,6 +149,29 @@ const scanDependenciesSchema = z.object({
   configurations: z.array(z.string().min(1)).optional(),
   includeLogTail: z.boolean().optional(),
   query: z.string().optional(),
+});
+
+const describeClassSchema = z
+  .object({
+    jarPath: z.string().min(1, "jarPath is required"),
+    className: z.string().optional(),
+    entryPath: z.string().optional(),
+    memberVisibility: z.enum(["public", "all"]).optional(),
+    methodQuery: z.string().optional(),
+    limit: z.number().int().positive().optional(),
+  })
+  .refine((data) => Boolean(data.className || data.entryPath), {
+    message: "className or entryPath is required",
+  });
+
+const resolveClassSchema = z.object({
+  projectPath: z.string().min(1, "projectPath is required"),
+  className: z.string().min(1, "className is required"),
+  dependencyQuery: z.string().optional(),
+  includeMembers: z.boolean().optional(),
+  memberVisibility: z.enum(["public", "all"]).optional(),
+  methodQuery: z.string().optional(),
+  limit: z.number().int().positive().optional(),
 });
 
 function normalizeJarEntry(p?: string): string {
@@ -322,6 +391,54 @@ function classNameFromEntry(entryPath: string): string {
     .replace(/^\.+/, "");
 }
 
+function normalizeClassName(value: string): string {
+  return value
+    .trim()
+    .replace(/<.*$/, "")
+    .replace(/\.class$/i, "")
+    .replace(/[\\/]/g, ".")
+    .replace(/^\.+/, "");
+}
+
+function classEntryPathFromName(value: string): string {
+  const normalized = normalizeClassName(value);
+  if (!normalized) return "";
+  return `${normalized.replace(/\./g, "/")}.class`;
+}
+
+function resolveClassNameInput(className?: string, entryPath?: string): string {
+  if (className && className.trim()) {
+    return normalizeClassName(className);
+  }
+  if (entryPath && entryPath.trim()) {
+    const normalizedEntry = normalizeJarEntry(entryPath);
+    if (!normalizedEntry.toLowerCase().endsWith(".class")) {
+      throw new Error("entryPath must point to a .class entry");
+    }
+    return classNameFromEntry(normalizedEntry);
+  }
+  throw new Error("className or entryPath is required");
+}
+
+function parseJavapMethodSignatures(output: string): string[] {
+  const methods: string[] = [];
+  for (const rawLine of output.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    if (line === "{" || line === "}") continue;
+    if (!line.includes("(") || !line.includes(")")) continue;
+    if (!line.endsWith(";")) continue;
+    methods.push(line);
+  }
+  return methods;
+}
+
+function filterMethodSignatures(methods: string[], query?: string): string[] {
+  const normalized = normalizeQuery(query);
+  if (!normalized) return methods;
+  return methods.filter((method) => method.toLowerCase().includes(normalized));
+}
+
 class JarViewerService {
   private dependencyCache = new Map<string, DependencyResult>();
 
@@ -413,6 +530,149 @@ class JarViewerService {
     }
 
     return await this.decompileWithCfr(resolvedJar, normalizedEntry);
+  }
+
+  async describeClass(options: DescribeClassOptions): Promise<DescribeClassResult> {
+    const {
+      jarPath,
+      className,
+      entryPath,
+      memberVisibility = "public",
+      methodQuery,
+      limit,
+    } = options;
+    const resolvedJar = path.resolve(jarPath);
+    if (!(await fileExists(resolvedJar))) {
+      throw new Error(`Jar file not found at ${resolvedJar}`);
+    }
+
+    const resolvedClassName = resolveClassNameInput(className, entryPath);
+    const visibility = memberVisibility === "all" ? "all" : "public";
+    const visibilityFlag = visibility === "all" ? "-private" : "-public";
+
+    let commandResult: CommandResult;
+    try {
+      commandResult = await runCommand(
+        "javap",
+        [visibilityFlag, "-classpath", resolvedJar, resolvedClassName],
+        { projectPath: resolvedJar },
+      );
+    } catch (error) {
+      if (isEnoent(error)) {
+        throw new Error("Java class inspector (javap) was not found on PATH.");
+      }
+      throw error instanceof Error ? error : new Error(String(error));
+    }
+
+    const { code, stdout, stderr } = commandResult;
+    if (code !== 0) {
+      throw new Error(`javap failed with code ${code}: ${stderr || stdout || "no output"}`);
+    }
+
+    const output = stdout || stderr || "";
+    let methods = parseJavapMethodSignatures(output);
+    methods = filterMethodSignatures(methods, methodQuery);
+
+    const total = methods.length;
+    const limitValue = limit && limit > 0 ? limit : undefined;
+    const truncated = Boolean(limitValue && total > limitValue);
+    if (limitValue) {
+      methods = methods.slice(0, limitValue);
+    }
+
+    const normalizedMethodQuery = methodQuery?.trim() ? methodQuery.trim() : undefined;
+
+    return {
+      jarPath: resolvedJar,
+      className: resolvedClassName,
+      visibility,
+      methodQuery: normalizedMethodQuery,
+      total,
+      truncated,
+      methods,
+    };
+  }
+
+  async resolveClass(options: ResolveClassOptions): Promise<ResolveClassResult> {
+    const {
+      projectPath,
+      className,
+      dependencyQuery,
+      includeMembers = false,
+      memberVisibility,
+      methodQuery,
+      limit,
+    } = options;
+    const resolvedProject = path.resolve(projectPath);
+    const normalizedClassName = normalizeClassName(className);
+    if (!normalizedClassName) {
+      throw new Error("className is required");
+    }
+
+    const entryPath = classEntryPathFromName(normalizedClassName);
+    if (!entryPath) {
+      throw new Error("className is required");
+    }
+
+    const dependenciesResult = await this.scanProjectDependencies({
+      projectPath: resolvedProject,
+      query: dependencyQuery,
+    });
+
+    let searchedJars = 0;
+    let resolvedJarPath: string | null = null;
+    for (const dependency of dependenciesResult.dependencies) {
+      const depPath = dependency.path;
+      if (!depPath) continue;
+      if (path.extname(depPath).toLowerCase() !== ".jar") continue;
+      const candidate = path.resolve(depPath);
+      if (!(await fileExists(candidate))) continue;
+      searchedJars += 1;
+      try {
+        const zip = new AdmZip(candidate);
+        const entry = zip.getEntry(entryPath);
+        if (entry && !entry.isDirectory) {
+          resolvedJarPath = candidate;
+          break;
+        }
+      } catch {
+        continue;
+      }
+    }
+
+    let methods: string[] | undefined;
+    let methodCount: number | undefined;
+    let methodsTruncated: boolean | undefined;
+    if (resolvedJarPath && includeMembers) {
+      const describeResult = await this.describeClass({
+        jarPath: resolvedJarPath,
+        className: normalizedClassName,
+        memberVisibility,
+        methodQuery,
+        limit,
+      });
+      methods = describeResult.methods;
+      methodCount = describeResult.total;
+      methodsTruncated = describeResult.truncated;
+    }
+
+    const trimmedQuery = dependencyQuery?.trim();
+    return {
+      projectPath: resolvedProject,
+      className: normalizedClassName,
+      entryPath,
+      jarPath: resolvedJarPath,
+      projectRoot: dependenciesResult.projectRoot,
+      projectType: dependenciesResult.projectType,
+      dependencyQuery: trimmedQuery ? trimmedQuery : undefined,
+      dependencyCount: dependenciesResult.dependencies.length,
+      searchedJars,
+      cachedDependencies: dependenciesResult.cached,
+      found: Boolean(resolvedJarPath),
+      methods,
+      methodCount,
+      methodsTruncated,
+    };
   }
 
   private async tryReadFromSourceJar(jarPath: string, entryPath: string): Promise<ReadJarResult | null> {
@@ -861,7 +1121,7 @@ async function main() {
         tools: {},
       },
       instructions:
-        "Use the provided tools to inspect JAR files. Prefer list_jar_entries before read_jar_entry to confirm exact paths.",
+        "Use the provided tools to inspect JAR files. Prefer resolve_class/describe_class for method signatures or API surface and list_jar_entries before read_jar_entry to confirm exact paths; only read sources when implementation detail is needed.",
     },
   );
 
@@ -898,6 +1158,34 @@ async function main() {
           },
         ],
       };
+    },
+  );
+
+  server.registerTool(
+    "describe_class",
+    {
+      title: "Describe class members",
+      description:
+        "Return method signatures for a class in a JAR using javap (no decompilation). Supports visibility and methodQuery filters for low-token API inspection.",
+      inputSchema: describeClassSchema,
+    },
+    async (input) => {
+      const result = await service.describeClass(input);
+      return formatToolResult(result);
+    },
+  );
+
+  server.registerTool(
+    "resolve_class",
+    {
+      title: "Resolve class location",
+      description:
+        "Locate a class inside project dependency jars and optionally return method signatures. Supports dependencyQuery to narrow jars and includeMembers for low-token API lookup.",
+      inputSchema: resolveClassSchema,
+    },
+    async (input) => {
+      const result = await service.resolveClass(input);
+      return formatToolResult(result);
     },
   );
 
