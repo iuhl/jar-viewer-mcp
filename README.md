@@ -2,17 +2,44 @@
 
 MCP server that lets an LLM browse JAR contents, attach `*-sources.jar` source, and decompile `.class` files with CFR. It also runs Maven/Gradle dependency resolution to surface absolute paths for local artifacts.
 
+Chinese doc: `README.zh-CN.md`.
+
 ## Prerequisites
 - Node.js 18+
 - Java 8+ (JDK with `javap`) on PATH (for CFR and describe_class)
 - Maven on PATH when using `scan_project_dependencies` for Maven projects
 - Gradle Wrapper (`./gradlew`) or Gradle on PATH when using `scan_project_dependencies` for Gradle projects
 
-## Install & Run
+## Quick start (npx)
+```bash
+npx -y jar-viewer-mcp@latest
+```
+
+### MCP config snippet
+Use this in your MCP client/registry (example format):
+```json
+{
+  "mcpServers": {
+    "jar-viewer": {
+      "command": "npx",
+      "args": ["-y", "jar-viewer-mcp@latest"]
+    }
+  }
+}
+```
+
+## Install options
+### Global install
+```bash
+npm install -g jar-viewer-mcp
+jar-viewer-mcp
+```
+
+### Local development
 ```bash
 npm install
 npm run build
-node dist/index.js   # or add to your MCP registry
+node dist/index.js
 ```
 
 ## Tools
