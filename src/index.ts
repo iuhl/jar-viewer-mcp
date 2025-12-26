@@ -66,6 +66,13 @@ type DependencyResult = {
   logTail?: string;
 };
 
+type ScanDependenciesOptions = {
+  projectPath: string;
+  excludeTransitive?: boolean;
+  configurations?: string[];
+  includeLogTail?: boolean;
+};
+
 type CommandResult = {
   code: number | null;
   stdout: string;
@@ -91,6 +98,9 @@ const readJarEntrySchema = z.object({
 
 const scanDependenciesSchema = z.object({
   projectPath: z.string().min(1, "projectPath is required"),
+  excludeTransitive: z.boolean().optional(),
+  configurations: z.array(z.string().min(1)).optional(),
+  includeLogTail: z.boolean().optional(),
 });
 
 function normalizeJarEntry(p?: string): string {
@@ -105,6 +115,37 @@ async function fileExists(filePath: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+function normalizeConfigurations(configurations?: string[]): string[] {
+  if (!configurations || configurations.length === 0) return [];
+  const unique = new Set(
+    configurations.map((value) => value.trim()).filter((value) => value.length > 0),
+  );
+  return Array.from(unique).sort((a, b) => a.localeCompare(b));
+}
+
+function buildDependencyCacheKey(
+  projectRoot: string,
+  options: { excludeTransitive?: boolean; configurations?: string[]; includeLogTail?: boolean },
+): string {
+  return JSON.stringify({
+    projectRoot,
+    excludeTransitive: Boolean(options.excludeTransitive),
+    configurations: normalizeConfigurations(options.configurations),
+    includeLogTail: Boolean(options.includeLogTail),
+  });
+}
+
+function escapeGroovyString(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+function formatGroovyStringList(values?: string[]): string {
+  const normalized = normalizeConfigurations(values);
+  if (normalized.length === 0) return "[]";
+  const items = normalized.map((value) => `"${escapeGroovyString(value)}"`);
+  return `[${items.join(", ")}]`;
 }
 
 async function findProjectMarkers(dir: string, markers: string[]): Promise<string[]> {
@@ -460,7 +501,13 @@ class JarViewerService {
     return { command: "gradle", shell: false };
   }
 
-  async scanProjectDependencies(projectPath: string): Promise<DependencyResult> {
+  async scanProjectDependencies(options: ScanDependenciesOptions): Promise<DependencyResult> {
+    const {
+      projectPath,
+      excludeTransitive = false,
+      configurations,
+      includeLogTail = false,
+    } = options;
     const resolvedProject = path.resolve(projectPath);
     const projectInfo = await detectProjectType(resolvedProject);
 
@@ -469,7 +516,12 @@ class JarViewerService {
     }
 
     const projectRoot = projectInfo.root ?? resolvedProject;
-    const cached = this.dependencyCache.get(projectRoot);
+    const cacheKey = buildDependencyCacheKey(projectRoot, {
+      excludeTransitive,
+      configurations,
+      includeLogTail,
+    });
+    const cached = this.dependencyCache.get(cacheKey);
     if (cached) {
       return {
         ...cached,
@@ -482,18 +534,26 @@ class JarViewerService {
 
     let result: DependencyResult;
     if (projectInfo.type === "maven") {
-      result = await this.scanMavenDependencies(resolvedProject, projectRoot);
+      result = await this.scanMavenDependencies(resolvedProject, projectRoot, {
+        excludeTransitive,
+        includeLogTail,
+      });
     } else {
-      result = await this.scanGradleDependencies(resolvedProject, projectRoot);
+      result = await this.scanGradleDependencies(resolvedProject, projectRoot, {
+        excludeTransitive,
+        configurations,
+        includeLogTail,
+      });
     }
 
-    this.dependencyCache.set(projectRoot, result);
+    this.dependencyCache.set(cacheKey, result);
     return result;
   }
 
   private async scanMavenDependencies(
     resolvedProject: string,
     projectRoot: string,
+    options: { excludeTransitive: boolean; includeLogTail: boolean },
   ): Promise<DependencyResult> {
     const tempDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "jar-viewer-mvn-"));
     const outputFile = path.join(tempDir, "dependencies.txt");
@@ -507,6 +567,9 @@ class JarViewerService {
         `-DoutputFile=${outputFile}`,
         "-B",
       ];
+      if (options.excludeTransitive) {
+        mvnArgs.push("-DexcludeTransitive=true");
+      }
 
       const { code, stdout, stderr } = await runCommand("mvn", mvnArgs, {
         cwd: projectRoot,
@@ -521,13 +584,16 @@ class JarViewerService {
       }
 
       const dependencies = parseMavenDependencyList(fileContent);
+      const logTail = options.includeLogTail
+        ? (stderr || stdout || "").trim().split("\n").slice(-10).join("\n")
+        : undefined;
       const result: DependencyResult = {
         projectPath: resolvedProject,
         projectRoot,
         projectType: "maven",
         dependencies,
         cached: false,
-        logTail: (stderr || stdout || "").trim().split("\n").slice(-10).join("\n"),
+        logTail,
       };
       return result;
     } catch (error) {
@@ -543,19 +609,39 @@ class JarViewerService {
   private async scanGradleDependencies(
     resolvedProject: string,
     projectRoot: string,
+    options: { excludeTransitive: boolean; configurations?: string[]; includeLogTail: boolean },
   ): Promise<DependencyResult> {
     const tempDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "jar-viewer-gradle-"));
     const initScriptPath = path.join(tempDir, "mcp-init.gradle");
+    const allowedConfigs = formatGroovyStringList(options.configurations);
     const initScript = [
+      `def mcpAllowedConfigs = ${allowedConfigs}`,
+      `def mcpExcludeTransitive = ${options.excludeTransitive ? "true" : "false"}`,
       "allprojects {",
       "  task mcpListDeps {",
       "    doLast {",
       "      configurations.each { config ->",
-      "        if (config.canBeResolved) {",
-      "          config.files.each { file ->",
-      "            println \"MCP_DEP|${config.name}|${file.name}|${file.absolutePath}\"",
+        "        if (config.canBeResolved) {",
+      "          if (!mcpAllowedConfigs.isEmpty() && !mcpAllowedConfigs.contains(config.name)) {",
+      "            return",
       "          }",
-      "        }",
+      "          def artifacts = []",
+      "          if (mcpExcludeTransitive) {",
+      "            config.resolvedConfiguration.firstLevelModuleDependencies.each { dep ->",
+      "              dep.moduleArtifacts.each { art ->",
+      "                artifacts << art",
+      "              }",
+      "            }",
+      "          } else {",
+      "            artifacts = config.resolvedConfiguration.resolvedArtifacts",
+      "          }",
+      "          artifacts.each { art ->",
+      "            def file = art.file",
+      "            if (file != null) {",
+      "              println \"MCP_DEP|${config.name}|${file.name}|${file.absolutePath}\"",
+      "            }",
+      "          }",
+        "        }",
       "      }",
       "    }",
       "  }",
@@ -581,13 +667,16 @@ class JarViewerService {
       }
 
       const dependencies = parseGradleDependencyOutput(stdout);
+      const logTail = options.includeLogTail
+        ? (stderr || stdout || "").trim().split("\n").slice(-10).join("\n")
+        : undefined;
       return {
         projectPath: resolvedProject,
         projectRoot,
         projectType: "gradle",
         dependencies,
         cached: false,
-        logTail: (stderr || stdout || "").trim().split("\n").slice(-10).join("\n"),
+        logTail,
       };
     } catch (error) {
       if (isEnoent(error)) {
@@ -723,7 +812,7 @@ function formatToolResult(result: unknown): CallToolResult {
     content: [
       {
         type: "text",
-        text: JSON.stringify(result, null, 2),
+        text: JSON.stringify(result),
       },
     ],
   };
@@ -783,13 +872,13 @@ async function main() {
   server.registerTool(
     "scan_project_dependencies",
     {
-      title: "Scan Maven dependencies",
+      title: "Scan project dependencies",
       description:
-        "Run Maven dependency:list to resolve absolute paths for project dependencies. Cached per project path.",
+        "Resolve absolute paths for Maven/Gradle dependencies. Supports excludeTransitive and Gradle configurations filters; cached per project root.",
       inputSchema: scanDependenciesSchema,
     },
-    async ({ projectPath }) => {
-      const result = await service.scanProjectDependencies(projectPath);
+    async (input) => {
+      const result = await service.scanProjectDependencies(input);
       return formatToolResult(result);
     },
   );
